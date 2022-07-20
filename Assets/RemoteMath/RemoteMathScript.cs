@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using KModkit;
+using RemoteMath.Actions;
 using UnityEngine;
 using UnityEngine.Serialization;
 
@@ -28,7 +29,7 @@ namespace RemoteMath
         [FormerlySerializedAs("FruitMats")] public Material[] fruitMats;
         [FormerlySerializedAs("Lights")] public Light[] lights;
         [FormerlySerializedAs("FruitNames")] public string[] fruitNames;
-        private RemoteMathWsApi.Handler _remoteMathApi;
+        private RemoteMathNet _remoteMathApi;
         private string _currentLed;
 
         private bool _moduleSolved;
@@ -37,6 +38,7 @@ namespace RemoteMath
         private bool _moduleStartup;
         private bool _hasErrored;
         private string _secretToken;
+        private byte _disconnectCount;
 
         private bool _twitchPlaysMode;
 #pragma warning disable CS0649
@@ -55,7 +57,7 @@ namespace RemoteMath
 
         private static int _moduleIdCounter = 1;
         private int _moduleId;
-        internal string TwitchId;
+        private string _twitchId;
 
         private void GetTwitchPlaysId()
         {
@@ -74,7 +76,7 @@ namespace RemoteMath
                 var rMath = behaviour.GetComponent<RemoteMathScript>();
                 if (rMath != this) continue;
                 var moduleCode = module.GetType().GetProperty("Code", BindingFlags.Public | BindingFlags.Instance);
-                if (moduleCode != null) TwitchId = (string) moduleCode.GetValue(module, null);
+                if (moduleCode != null) _twitchId = (string) moduleCode.GetValue(module, null);
             }
         }
 
@@ -96,7 +98,7 @@ namespace RemoteMath
                     secretCodeText.SetActive(true);
                     welcomeText.SetActive(false);
                     _moduleStartup = true;
-                    StartCoroutine(StartWebsocketClient());
+                    StartCoroutine(StartUdpClient());
                     return false;
                 }
 
@@ -113,38 +115,103 @@ namespace RemoteMath
 
         private void OnDestroy()
         {
-            if (_moduleStartup && _isConnected) _remoteMathApi.Stop();
+            if (_moduleStartup && _isConnected) _remoteMathApi.Close();
         }
 
         // ReSharper disable Unity.PerformanceAnalysis
-        private IEnumerator StartWebsocketClient()
+        private IEnumerator StartUdpClient()
         {
-            _remoteMathApi = new RemoteMathWsApi.Handler(this);
-            _remoteMathApi.PuzzleCode += ReceivedPuzzleCode;
-            _remoteMathApi.PuzzleToken += ReceivedPuzzleToken;
-            _remoteMathApi.PuzzleComplete += ReceivedPuzzleComplete;
-            _remoteMathApi.PuzzleStrike += ReceivedPuzzleStrike;
-            _remoteMathApi.PuzzleError += ReceivedPuzzleError;
-            _remoteMathApi.PuzzleLog += ReceivedPuzzleLog;
-            _remoteMathApi.Connected += WsConnected;
-            _remoteMathApi.Disconnected += WsDisconnected;
-            _remoteMathApi.PuzzleTwitchCode += ReceivedPuzzleTwitchPlaysCode;
-            _remoteMathApi.Start(_secretToken);
-            SetLed("Yellow");
+            _remoteMathApi = new RemoteMathNet();
+            _remoteMathApi.Message += NetMessage;
+            _remoteMathApi.Disconnect += NetDisconnected;
+            _remoteMathApi.Error += NetError;
+            _remoteMathApi.Connect(_secretToken);
+            Debug.LogFormat("[Remote Math #{0}] WebSocket Connected", _moduleId);
+            SetLed("White");
+            _isConnected = true;
             yield return WaitForWebsocketTimeout();
             yield return null;
         }
 
-        // ReSharper disable Unity.PerformanceAnalysis
-        private void ReceivedPuzzleLog(RemoteMathWsApi.PuzzleLogEventArgs e)
+        private void NetDisconnected(object sender, EventArgs e)
         {
-            Debug.LogFormat("[Remote Math #{0}] {2}: {1}", _moduleId, e.Message, e.FromServer ? "Server message" : "Websocket API");
+            if (_allowedToSolve) return;
+            Debug.LogFormat("[Remote Math #{0}] Connection disconnected... attempting reconnect", _moduleId);
+            // ReSharper disable once StringLiteralTypo
+            SetSecretCode("NETDCN");
+            SetLed("Purple");
+            _isConnected = false;
+            if (_secretToken != "")
+            {
+                // If there is more than 3 disconnects then error
+                _disconnectCount++;
+                if (_disconnectCount > 3) NetError(sender, e);
+                else _remoteMathApi.Connect(_secretToken);
+            }
+            else NetError(sender, e);
+        }
+
+        private void NetError(object sender, EventArgs e)
+        {
+            if (_allowedToSolve) return;
+            Debug.LogFormat("[Remote Math #{0}] Connection error... auto solve mode", _moduleId);
+            // ReSharper disable once StringLiteralTypo
+            SetSecretCode("NETERR");
+            SetLed("Blue");
+            _isConnected = false;
+            _hasErrored = true;
+            TriggerModuleSolve();
+        }
+
+        private void NetMessage(object sender, RemoteMathNet.MessageEventArgs e)
+        {
+            switch (e.Message.Action)
+            {
+                case ActionByte.PuzzleCreate:
+                    break;
+                case ActionByte.PuzzleInvalid:
+                    break;
+                case ActionByte.PuzzleToken:
+                    ActionParse.PuzzleToken(e.Message.Data, out _secretToken);
+                    Debug.LogFormat("[Remote Math #{0}] Puzzle token: {1}", _moduleId, _secretToken);
+                    break;
+                case ActionByte.PuzzleLog:
+                    string logCode;
+                    ActionParse.PuzzleLog(e.Message.Data, out logCode);
+                    Debug.LogFormat("[Remote Math #{0}] Log URL: {1}", _moduleId, logCode);
+                    break;
+                case ActionByte.PuzzleCode:
+                    string code;
+                    ActionParse.PuzzleCode(e.Message.Data, out code);
+                    Debug.LogFormat("[Remote Math #{0}] Puzzle Code: {1}", _moduleId, code);
+                    var dispatcher = UnityMainThreadDispatcher.Instance();
+                    dispatcher.Enqueue(SendPuzzleFruit());
+                    dispatcher.Enqueue(SendBombDetails());
+                    SetSecretCode(code);
+                    break;
+                case ActionByte.PuzzleSolve:
+                    Debug.LogFormat("[Remote Math #{0}] Puzzle Completed", _moduleId);
+                    SetSecretCode("DONE", true);
+                    SetLed("Orange");
+                    _remoteMathApi.Close();
+                    TriggerModuleSolve();
+                    break;
+                case ActionByte.PuzzleStrike:
+                    Debug.LogFormat("[Remote Math #{0}] Puzzle Strike", _moduleId);
+                    HandleStrike();
+                    break;
+                case ActionByte.PuzzleTwitchCode:
+                    string twitchCode;
+                    ActionParse.PuzzleTwitchCode(e.Message.Data, out twitchCode);
+                    _twitchPlaysCodes.Add(twitchCode);
+                    break;
+            }
         }
 
         private IEnumerator SendPuzzleFruit()
         {
-            var fruitNumbers = new List<int>();
-            for (var i = 0; i < 8; i++) fruitNumbers.Add(Convert.ToInt32(Math.Floor(UnityEngine.Random.Range(0f, fruitMats.Length))));
+            var fruitNumbers = new List<byte>();
+            for (var i = 0; i < 8; i++) fruitNumbers.Add((byte) UnityEngine.Random.Range(0f, fruitMats.Length));
 
             fruit1.transform.Find("FruitImage").gameObject.GetComponent<MeshRenderer>().material = fruitMats[fruitNumbers[0]];
             fruit2.transform.Find("FruitImage").gameObject.GetComponent<MeshRenderer>().material = fruitMats[fruitNumbers[1]];
@@ -153,7 +220,7 @@ namespace RemoteMath
             fruit1.SetActive(true);
             fruit2.SetActive(true);
             Debug.LogFormat("[Remote Math #{0}] Puzzle Fruits: {1}", _moduleId, fruitNumbers.ToArray().Join(", "));
-            _remoteMathApi.Send("PuzzleFruits::" + fruitNumbers.ToArray().Join("::"));
+            _remoteMathApi.Send(ActionFactory.PuzzleFruits(fruitNumbers.ToArray()));
             yield return null;
         }
 
@@ -162,80 +229,14 @@ namespace RemoteMath
             var batteryCount = bombInfo.GetBatteryCount();
             var portCount = bombInfo.GetPortCount();
             Debug.LogFormat("[Remote Math #{0}] Battery Count: {1}, Port Count: {2}", _moduleId, batteryCount, portCount);
-            _remoteMathApi.Send("BombDetails::" + batteryCount + "::" + portCount);
+            _remoteMathApi.Send(ActionFactory.BombDetails(batteryCount, portCount));
             yield return null;
-        }
-
-        private void ReceivedPuzzleCode(RemoteMathWsApi.PuzzleCodeEventArgs e)
-        {
-            Debug.LogFormat("[Remote Math #{0}] Puzzle Code: {1}", _moduleId, e.Code);
-            UnityMainThreadDispatcher.Instance().Enqueue(SendPuzzleFruit());
-            UnityMainThreadDispatcher.Instance().Enqueue(SendBombDetails());
-            SetSecretCode(e.Code);
-        }
-
-        private void ReceivedPuzzleToken(RemoteMathWsApi.PuzzleTokenEventArgs e)
-        {
-            Debug.LogFormat("[Remote Math #{0}] Puzzle Token: {1}", _moduleId, e.Token);
-            this._secretToken = e.Token;
-        }
-
-        private void ReceivedPuzzleTwitchPlaysCode(RemoteMathWsApi.PuzzleTwitchCodeEventArgs e)
-        {
-            _twitchPlaysCodes.Add(e.Code);
         }
 
         private void TriggerModuleSolve()
         {
             _allowedToSolve = true;
         }
-
-        private void ReceivedPuzzleComplete()
-        {
-            Debug.LogFormat("[Remote Math #{0}] Puzzle Completed", _moduleId);
-            SetSecretCode("DONE", true);
-            SetLed("Orange");
-            _remoteMathApi.Stop();
-            TriggerModuleSolve();
-        }
-
-        private void ReceivedPuzzleStrike()
-        {
-            Debug.LogFormat("[Remote Math #{0}] Puzzle Strike", _moduleId);
-            HandleStrike();
-        }
-
-        private void ReceivedPuzzleError()
-        {
-            Debug.LogFormat("[Remote Math #{0}] Puzzle Error", _moduleId);
-            SetSecretCode("ERROR");
-            SetLed("Blue");
-            _hasErrored = true;
-            _remoteMathApi.Stop();
-            TriggerModuleSolve();
-        }
-
-        private void WsConnected(object sender, EventArgs e)
-        {
-            _remoteMathApi.Login();
-            Debug.LogFormat("[Remote Math #{0}] WebSocket Connected", _moduleId);
-            SetLed("White");
-            _isConnected = true;
-        }
-
-        private void WsDisconnected(object sender, EventArgs e)
-        {
-            if (_allowedToSolve) return;
-            Debug.LogFormat("[Remote Math #{0}] WebSocket Disconnected... attempting reconnect", _moduleId);
-            SetSecretCode("ERROR");
-            SetLed("Purple");
-            _isConnected = false;
-            _hasErrored = true;
-            _remoteMathApi.Stop();
-            if (_secretToken != "") _remoteMathApi.Start(_secretToken);
-            else TriggerModuleSolve();
-        }
-
 
         private void SetLed(string led)
         {
@@ -264,7 +265,7 @@ namespace RemoteMath
             if (_isConnected) yield break;
             Debug.LogFormat("[Remote Math #{0}] WebSocket Connection Failed", _moduleId);
             SetLed("Blue");
-            _remoteMathApi.Stop();
+            _remoteMathApi.Close();
             TriggerModuleSolve();
         }
 
@@ -335,7 +336,7 @@ namespace RemoteMath
                 yield return null;
                 if (_twitchPlaysCodes.Contains(code))
                 {
-                    _remoteMathApi.Send("PuzzleActivateTwitchCode::" + code);
+                    _remoteMathApi.Send(ActionFactory.PuzzleTwitchConfirmCode(code));
                     // ReSharper disable once StringLiteralTypo
                     yield return "sendtochat The requested expert module for Remote Math {1} has been activated";
                     yield return "strike";
