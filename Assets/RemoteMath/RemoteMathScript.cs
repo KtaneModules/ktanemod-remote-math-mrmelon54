@@ -34,7 +34,6 @@ namespace RemoteMath
 
         private bool _moduleSolved;
         private bool _allowedToSolve;
-        private bool _isConnected;
         private bool _moduleStartup;
         private bool _hasErrored;
         private string _secretToken;
@@ -115,7 +114,7 @@ namespace RemoteMath
 
         private void OnDestroy()
         {
-            if (_moduleStartup && _isConnected) _remoteMathApi.Close();
+            if (_moduleStartup && _remoteMathApi.IsAlive()) _remoteMathApi.Close();
         }
 
         // ReSharper disable Unity.PerformanceAnalysis
@@ -126,9 +125,8 @@ namespace RemoteMath
             _remoteMathApi.Disconnect += NetDisconnected;
             _remoteMathApi.Error += NetError;
             _remoteMathApi.Connect(_secretToken);
-            Debug.LogFormat("[Remote Math #{0}] WebSocket Connected", _moduleId);
+            Debug.LogFormat("[Remote Math #{0}] Connected", _moduleId);
             SetLed("White");
-            _isConnected = true;
             yield return WaitForWebsocketTimeout();
             yield return null;
         }
@@ -136,11 +134,15 @@ namespace RemoteMath
         private void NetDisconnected(object sender, EventArgs e)
         {
             if (_allowedToSolve) return;
+            if (_remoteMathApi.IsClosing())
+            {
+                Debug.LogFormat("[Remote Math #{0}] Connection disconnected for module destruction",_moduleId);
+                return;
+            }
             Debug.LogFormat("[Remote Math #{0}] Connection disconnected... attempting reconnect", _moduleId);
             // ReSharper disable once StringLiteralTypo
             SetSecretCode("NETDCN");
             SetLed("Purple");
-            _isConnected = false;
             if (_secretToken != "")
             {
                 // If there is more than 3 disconnects then error
@@ -158,7 +160,6 @@ namespace RemoteMath
             // ReSharper disable once StringLiteralTypo
             SetSecretCode("NETERR");
             SetLed("Blue");
-            _isConnected = false;
             _hasErrored = true;
             TriggerModuleSolve();
         }
@@ -262,8 +263,8 @@ namespace RemoteMath
         private IEnumerator WaitForWebsocketTimeout()
         {
             yield return new WaitForSeconds(15f);
-            if (_isConnected) yield break;
-            Debug.LogFormat("[Remote Math #{0}] WebSocket Connection Failed", _moduleId);
+            if (_remoteMathApi.IsAlive()) yield break;
+            Debug.LogFormat("[Remote Math #{0}] Connection Failed", _moduleId);
             SetLed("Blue");
             _remoteMathApi.Close();
             TriggerModuleSolve();

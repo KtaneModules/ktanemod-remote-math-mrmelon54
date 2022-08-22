@@ -64,21 +64,38 @@ namespace RemoteMath
 
         public void Connect(string token)
         {
-            _conn.Connect(ServerAddress, ServerPort);
-            _writeProc = new Thread(InternalWriteProc) {IsBackground = true};
-            _writeProc.Start();
-            _readProc = new Thread(InternalReadProc) {IsBackground = true};
-            _readProc.Start();
-            Send(token == "" ? ActionFactory.CreateEmpty(ActionByte.PuzzleCreate) : ActionFactory.PuzzleReconnect(token));
+            try
+            {
+                _conn.Connect(ServerAddress, ServerPort);
+                _writeProc = new Thread(InternalWriteProc) {IsBackground = true};
+                _writeProc.Start();
+                _readProc = new Thread(InternalReadProc) {IsBackground = true};
+                _readProc.Start();
+                Send(string.IsNullOrEmpty(token) ? ActionFactory.CreateEmpty(ActionByte.PuzzleCreate) : ActionFactory.PuzzleReconnect(token));
+            }
+            catch (Exception)
+            {
+                Close();
+            }
         }
 
         public void Close()
         {
             _killMode = true;
-            _writeProc.Join(TimeSpan.FromSeconds(5));
-            if (_writeProc.IsAlive) _writeProc.Abort();
-            _readProc.Join(TimeSpan.FromSeconds(5));
-            if (_readProc.IsAlive) _readProc.Abort();
+            if (_writeProc != null)
+            {
+                _writeProc.Join(TimeSpan.FromSeconds(5));
+                if (_writeProc.IsAlive) _writeProc.Abort();
+                _writeProc = null;
+            }
+
+            if (_readProc != null)
+            {
+                _readProc.Join(TimeSpan.FromSeconds(5));
+                if (_readProc.IsAlive) _readProc.Abort();
+                _readProc = null;
+            }
+
             _conn.Close();
             OnDisconnect();
         }
@@ -93,17 +110,18 @@ namespace RemoteMath
             while (true)
             {
                 _conn.Update();
-                if (_killMode) break;
+                if (_killMode) return;
                 using (var eWrite = _toWrite.GetEnumerator())
                     while (eWrite.MoveNext())
                     {
                         if (_killMode) return;
-                        if (eWrite.Current == null) continue;
+                        if (eWrite.Current == null) goto writeOuter;
                         var b = eWrite.Current.Encode();
                         _conn.Send(b, 0, b.Length);
                     }
             }
 
+            writeOuter:
             OnError();
         }
 
@@ -139,6 +157,11 @@ namespace RemoteMath
             }
 
             OnError();
+        }
+
+        public bool IsClosing()
+        {
+            return _killMode;
         }
     }
 }
